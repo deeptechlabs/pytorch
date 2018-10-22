@@ -28,7 +28,7 @@ template <typename Dataset, typename Sampler>
 class DataLoader {
  public:
   using Batch = typename Dataset::BatchType;
-  using IndexBatch = std::vector<size_t>;
+  using Index = typename Sampler::IndexType;
 
   /// Constructs a new `DataLoader` from a `dataset` to sample from, `options`
   /// to configure the `DataLoader` with, and a `sampler` that specifies the
@@ -37,29 +37,20 @@ class DataLoader {
       : options_(std::move(options)),
         sampler_(std::move(sampler)),
         sequencer_(new_sequencer()) {
-    // clang-format off
-    AT_CHECK(
-        options_.batch_size <= dataset.size(),
-        "Batch size (was ", options_.batch_size, ") ",
-        "must not be larger than the dataset size (was ",
-        dataset.size(), ")");
-    // clang-format on
-
-    if (options_.workers > 0) {
-      for (size_t w = 0; w < options_.workers; ++w) {
-        // Here we copy the dataset into the worker thread closure. Each worker
-        // has its own copy of the dataset. This means the dataset must be
-        // trivially copiable, or else we don't expect more than one worker to
-        // be in use.
-        workers_.emplace_back(
-            [this, dataset] { this->worker_thread(std::move(dataset)); });
-      }
-    } else {
+    for (size_t w = 0; w < options_.workers; ++w) {
+      // Here we copy the dataset into the worker thread closure. Each worker
+      // has its own copy of the dataset. This means the dataset must be
+      // trivially copiable, or else we don't expect more than one worker to
+      // be in use.
+      workers_.emplace_back(
+          [this, dataset] { this->worker_thread(std::move(dataset)); });
+    }
+    if (options_.workers == 0) {
       main_thread_dataset_ = torch::make_unique<Dataset>(std::move(dataset));
     }
   }
 
-  ~DataLoader() {
+  virtual ~DataLoader() {
     join();
   }
 
@@ -131,10 +122,9 @@ class DataLoader {
   struct Job : Sequenced {
     Job() = default;
     Job(QuitWorker q, size_t sqn) : Sequenced(sqn), quit(q) {}
-    Job(IndexBatch&& i, size_t sqn)
-        : Sequenced(sqn), index_batch(std::move(i)) {}
+    Job(Index&& i, size_t sqn) : Sequenced(sqn), index_batch(std::move(i)) {}
     optional<QuitWorker> quit;
-    optional<IndexBatch> index_batch;
+    optional<Index> index_batch;
   };
 
   /// The finished result of a job.
@@ -163,7 +153,7 @@ class DataLoader {
   /// number of jobs scheduled may be less if the `DataLoader` exhausts.
   void prefetch(size_t requested_jobs) {
     while (requested_jobs-- > 0) {
-      if (auto index_batch = get_index_batch()) {
+      if (auto index_batch = get_index()) {
         push_job(std::move(*index_batch));
       } else {
         break;
@@ -192,7 +182,7 @@ class DataLoader {
           prefetch(1);
         }
       }
-    } else if (auto index_batch = get_index_batch()) {
+    } else if (auto index_batch = get_index()) {
       AT_ASSERT(main_thread_dataset_ != nullptr);
       batch = main_thread_dataset_->get_batch(std::move(*index_batch));
     }
@@ -215,13 +205,13 @@ class DataLoader {
     }
   }
 
-  optional<IndexBatch> get_index_batch() {
+  optional<Index> get_index() {
     auto indices = sampler_.next(options_.batch_size);
     if (!indices ||
         (indices->size() < options_.batch_size && options_.drop_last)) {
       return nullopt;
     }
-    AT_ASSERT(!indices->empty());
+    AT_ASSERT(indices->size() > 0);
     return indices;
   }
 

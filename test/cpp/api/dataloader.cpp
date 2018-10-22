@@ -8,6 +8,7 @@
 
 #include <ATen/core/ArrayRef.h>
 
+#include <algorithm>
 #include <chrono>
 #include <future>
 #include <iostream>
@@ -51,56 +52,39 @@ TEST(DataTest, TransformCallsGetApplyCorrectly) {
 }
 
 struct InfiniteStreamDataset
-    : datasets::BatchDataset<InfiniteStreamDataset, std::vector<int>> {
-  std::vector<int> get_batch(torch::ArrayRef<size_t> batch_size) override {
-    AT_ASSERT(batch_size.size() == 1);
-    std::vector<int> batch(batch_size.front());
+    : datasets::StreamDataset<InfiniteStreamDataset, std::vector<int>> {
+  std::vector<int> get_batch(size_t batch_size) override {
+    std::vector<int> batch(batch_size);
     for (auto& i : batch) {
       i = counter++;
     }
     return batch;
   }
 
-  size_t size() const override {
-    return std::numeric_limits<size_t>::max();
-  }
-
   size_t counter = 0;
-};
-
-struct BatchSizeSampler : samplers::Sampler {
-  void reset() override {}
-  at::optional<std::vector<size_t>> next(size_t batch_size) override {
-    return {{batch_size}};
-  }
 };
 
 TEST(DataTest, InfiniteStreamDataset) {
   const size_t kBatchSize = 13;
-
-  {
-    BatchSizeSampler sampler;
-    ASSERT_EQ(sampler.next(kBatchSize).value().size(), 1);
-    ASSERT_EQ(sampler.next(kBatchSize).value().front(), kBatchSize);
-  }
 
   auto dataset = InfiniteStreamDataset().map(
       transforms::Lambda<int>([](int x) { return x + 1; }));
 
   auto data_loader = torch::data::make_data_loader(
       std::move(dataset),
-      DataLoaderOptions().batch_size(kBatchSize),
-      BatchSizeSampler{});
+      kBatchSize,
+      samplers::StreamSampler(/*epoch_size=*/39));
 
-  auto iterator = data_loader->begin();
-  for (size_t i = 0; i < 3; ++i, ++iterator) {
-    ASSERT_NE(iterator, data_loader->end());
-    std::vector<int> batch = *iterator;
+  size_t batch_index = 0;
+  for (auto& batch : *data_loader) {
+    ASSERT_LT(batch_index, 3);
+    batch_index += 1;
     ASSERT_EQ(batch.size(), kBatchSize);
     for (size_t j = 0; j < kBatchSize; ++j) {
-      ASSERT_EQ(batch.at(j), 1 + (i * kBatchSize) + j);
+      ASSERT_EQ(batch.at(j), 1 + (batch_index * kBatchSize) + j);
     }
   }
+  ASSERT_EQ(batch_index, 3);
 }
 
 TEST(DataTest, NoSequencerIsIdentity) {
@@ -252,6 +236,24 @@ TEST(DataTest, RandomSamplerResetsWell) {
   ASSERT_FALSE(sampler.next(2).has_value());
 }
 
+TEST(DataTest, StreamSamplerReturnsTheBatchSizeAndThenRemainder) {
+  samplers::StreamSampler sampler(/*epoch_size=*/100);
+  ASSERT_EQ(sampler.next(10).value(), 10);
+  ASSERT_EQ(sampler.next(2).value(), 2);
+  ASSERT_EQ(sampler.next(85).value(), 85);
+  ASSERT_EQ(sampler.next(123).value(), 3);
+  ASSERT_FALSE(sampler.next(1).has_value());
+}
+
+TEST(DataTest, StreamSamplerResetsWell) {
+  samplers::StreamSampler sampler(/*epoch_size=*/5);
+  ASSERT_EQ(sampler.next(5).value().size(), 5);
+  ASSERT_FALSE(sampler.next(2).has_value());
+  sampler.reset();
+  ASSERT_EQ(sampler.next(5).value().size(), 5);
+  ASSERT_FALSE(sampler.next(2).has_value());
+}
+
 TEST(DataTest, TensorDatasetConstructsFromSingleTensor) {
   datasets::TensorDataset dataset(torch::eye(5));
   ASSERT_TRUE(
@@ -343,6 +345,41 @@ TEST(DataTest, TensorLambdaWorksforAnyTargetType) {
 
   ASSERT_TRUE(batch[1].data.allclose(torch::tensor(4.0)));
   ASSERT_EQ(batch[1].target, "2");
+}
+
+struct UnCopyableDataset : public datasets::Dataset<UnCopyableDataset> {
+  UnCopyableDataset() = default;
+
+  UnCopyableDataset(const UnCopyableDataset&) = delete;
+  UnCopyableDataset& operator=(const UnCopyableDataset&) = delete;
+
+  UnCopyableDataset(UnCopyableDataset&&) = default;
+  UnCopyableDataset& operator=(UnCopyableDataset&&) = default;
+
+  ~UnCopyableDataset() = default;
+
+  Example<> get(size_t index) override {
+    return {torch::tensor(static_cast<int64_t>(index)),
+            torch::tensor(static_cast<int64_t>(index))};
+  }
+
+  size_t size() const override {
+    return 100;
+  }
+};
+
+TEST(DataTest, MapDoesNotCopy) {
+  auto dataset = UnCopyableDataset()
+                     .map(transforms::TensorLambda<>(
+                         [](torch::Tensor tensor) { return tensor + 1; }))
+                     .map(transforms::TensorLambda<>(
+                         [](torch::Tensor tensor) { return tensor + 2; }))
+                     .map(transforms::TensorLambda<>(
+                         [](torch::Tensor tensor) { return tensor + 3; }));
+
+  auto data = dataset.get_batch(1).at(0).data;
+  ASSERT_EQ(data.numel(), 1);
+  ASSERT_EQ(data[0].item<float>(), 7);
 }
 
 TEST(DataTest, QueuePushAndPopFromSameThread) {
@@ -440,6 +477,54 @@ TEST(DataTest, DataShuttlePopResultTimesOut) {
   torch::data::detail::DataShuttle<int, int> shuttle;
   shuttle.push_job(1);
   ASSERT_THROWS_WITH(shuttle.pop_result(10 * kMillisecond), "Timeout");
+}
+
+struct TestIndex : public torch::data::samplers::CustomIndex {
+  explicit TestIndex(size_t offset, std::vector<size_t> index)
+      : offset(offset), index(std::move(index)) {}
+  size_t size() const override {
+    return index.size();
+  }
+  size_t offset;
+  std::vector<size_t> index;
+};
+
+struct TestIndexDataset
+    : datasets::BatchDataset<TestIndexDataset, std::vector<int>, TestIndex> {
+  explicit TestIndexDataset(size_t size) : data(size) {
+    std::iota(data.begin(), data.end(), size_t(0));
+  }
+  std::vector<int> get_batch(TestIndex index) override {
+    std::vector<int> batch;
+    for (size_t i : index.index) {
+      batch.push_back(index.offset + data.at(i));
+    }
+    return batch;
+  }
+  std::vector<int> data;
+};
+
+struct TestIndexSampler : public samplers::Sampler<TestIndex> {
+  void reset() {}
+  torch::optional<TestIndex> next(size_t batch_size) override {
+    std::vector<size_t> indices(batch_size);
+    std::iota(indices.begin(), indices.end(), size_t(0));
+    return TestIndex(batch_size, std::move(indices));
+  }
+};
+
+TEST(DataTest, CanUseCustomTypeAsIndexType) {
+  const size_t kBatchSize = 10;
+  auto data_loader = torch::data::make_data_loader(
+      TestIndexDataset(123),
+      /*batch_size=*/kBatchSize,
+      TestIndexSampler{});
+
+  for (auto batch : *data_loader) {
+    for (int i = 0; i < kBatchSize; ++i) {
+      ASSERT_EQ(batch.at(i), kBatchSize + i);
+    }
+  }
 }
 
 TEST(DataLoaderTest, DataLoaderOptionsDefaultAsExpected) {
@@ -575,14 +660,6 @@ TEST(DataLoaderTest, DereferencingSentinelIteratorThrows) {
       "Dereferencing the DataLoader's past-the-end iterator is not allowed");
 }
 
-TEST(DataLoaderTest, ThrowsWhenBatchSizeExceedsDatasetSize) {
-  DummyDataset dataset;
-  ASSERT_THROWS_WITH(
-      torch::data::make_data_loader(dataset, dataset.size() + 1),
-      "Batch size (was 101) must not be larger "
-      "than the dataset size (was 100)");
-}
-
 TEST(DataLoaderTest, YieldsCorrectBatchSize) {
   DummyDataset dataset;
   auto data_loader = torch::data::make_data_loader(dataset, 25);
@@ -672,7 +749,7 @@ struct OrderingTestDataset : datasets::BatchDataset<DummyDataset, int> {
     return thread_id;
   }
 
-  size_t size() const override {
+  size_t size() const {
     return 4;
   }
 };
